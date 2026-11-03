@@ -1850,6 +1850,7 @@ impl Reactor {
                         requested.0,
                         &mut effective_mouse_state,
                         mission_control_active,
+                        &self.space_state.screens,
                     ),
                     window_workflow::FrameChangeDisposition::Handled
                 ) {

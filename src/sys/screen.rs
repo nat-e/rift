@@ -23,7 +23,7 @@ use super::skylight::{
     SLSGetMenuBarAutohideEnabled, SLSGetSpaceManagementMode,
 };
 use crate::common::collections::HashMap;
-use crate::sys::geometry::CGRectDef;
+use crate::sys::geometry::{CGRectDef, CGRectExt};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
@@ -506,31 +506,76 @@ struct NSScreenInfo {
 pub struct Actual {
     mtm: MainThreadMarker,
 }
+
+fn connected_displays() -> Result<Vec<CGScreenInfo>, CGError> {
+    const MAX_SCREENS: usize = 64;
+    let mut ids: MaybeUninit<[CGDirectDisplayID; MAX_SCREENS]> = MaybeUninit::uninit();
+    let mut count: u32 = 0;
+    let ids = unsafe {
+        let err = CGGetActiveDisplayList(
+            MAX_SCREENS as u32,
+            ids.as_mut_ptr() as *mut CGDirectDisplayID,
+            &mut count,
+        );
+        if err != CGError::Success {
+            return Err(err);
+        }
+        std::slice::from_raw_parts(ids.as_ptr() as *const u32, count as usize)
+    };
+    Ok(ids
+        .iter()
+        .map(|&cg_id| CGScreenInfo {
+            cg_id: ScreenId(cg_id),
+            bounds: CGDisplayBounds(cg_id),
+        })
+        .collect())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONNECTED_DISPLAYS: std::cell::RefCell<Option<Vec<CGScreenInfo>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether the connected displays are still the ones `screens` describes: the
+/// same displays, each still containing its screen's frame. Displays that cannot
+/// be read are not evidence of a change, so they count as a match.
+pub fn displays_match(screens: &[ScreenInfo]) -> bool {
+    #[cfg(test)]
+    let displays = TEST_CONNECTED_DISPLAYS.with(|displays| displays.borrow().clone());
+    #[cfg(not(test))]
+    let displays = connected_displays().ok();
+    displays.is_none_or(|displays| screens_fit_displays(screens, &displays))
+}
+
+/// A screen's frame is the usable part of its display, without the menu bar and
+/// Dock, so it can only be checked to fit inside the display, not to equal it.
+fn screens_fit_displays(screens: &[ScreenInfo], displays: &[CGScreenInfo]) -> bool {
+    screens.len() == displays.len()
+        && screens.iter().all(|screen| {
+            displays.iter().any(|display| {
+                display.cg_id == screen.id && display.bounds.contains_rect(screen.frame)
+            })
+        })
+}
+
+/// Displays that `displays_match` sees in tests, as (id, bounds). `None`, the
+/// default, makes every set of screens match.
+#[cfg(test)]
+pub fn set_connected_displays_override(displays: Option<Vec<(ScreenId, CGRect)>>) {
+    TEST_CONNECTED_DISPLAYS.with(|override_displays| {
+        *override_displays.borrow_mut() = displays.map(|displays| {
+            displays
+                .into_iter()
+                .map(|(cg_id, bounds)| CGScreenInfo { cg_id, bounds })
+                .collect()
+        });
+    });
+}
+
 #[allow(private_interfaces)]
 impl System for Actual {
-    fn cg_screens(&self) -> Result<Vec<CGScreenInfo>, CGError> {
-        const MAX_SCREENS: usize = 64;
-        let mut ids: MaybeUninit<[CGDirectDisplayID; MAX_SCREENS]> = MaybeUninit::uninit();
-        let mut count: u32 = 0;
-        let ids = unsafe {
-            let err = CGGetActiveDisplayList(
-                MAX_SCREENS as u32,
-                ids.as_mut_ptr() as *mut CGDirectDisplayID,
-                &mut count,
-            );
-            if err != CGError::Success {
-                return Err(err);
-            }
-            std::slice::from_raw_parts(ids.as_ptr() as *const u32, count as usize)
-        };
-        Ok(ids
-            .iter()
-            .map(|&cg_id| CGScreenInfo {
-                cg_id: ScreenId(cg_id),
-                bounds: CGDisplayBounds(cg_id),
-            })
-            .collect())
-    }
+    fn cg_screens(&self) -> Result<Vec<CGScreenInfo>, CGError> { connected_displays() }
 
     fn display_uuid(&self, screen: &CGScreenInfo) -> CFRetained<CFString> {
         unsafe {
@@ -1134,6 +1179,57 @@ mod test {
         assert_eq!(after[0].display_uuid, "after-wake");
         assert_eq!(converter.screen_height(), Some(1080.));
         assert!(cache.system.cg_screens.borrow().is_empty());
+    }
+
+    #[test]
+    fn screens_fit_displays_only_while_each_display_still_holds_its_screen() {
+        use super::{ScreenInfo, displays_match, screens_fit_displays};
+        let rect = |x, y, w, h| CGRect::new(CGPoint::new(x, y), CGSize::new(w, h));
+        let screen = |id, frame| ScreenInfo {
+            id: ScreenId::new(id),
+            frame,
+            backing_scale: 1.,
+            is_builtin: false,
+            display_uuid: format!("display-{id}"),
+            name: None,
+            space: None,
+        };
+        let display = |id, bounds| CGScreenInfo {
+            cg_id: ScreenId::new(id),
+            bounds,
+        };
+        // Each screen is its display without the menu bar.
+        let screens = [
+            screen(1, rect(0., 31., 3008., 1661.)),
+            screen(2, rect(623., 1726., 1728., 1083.)),
+        ];
+        let external = display(1, rect(0., 0., 3008., 1692.));
+        let builtin = display(2, rect(623., 1692., 1728., 1117.));
+        let other = display(3, rect(-1920., 0., 1920., 1080.));
+        for (case, displays, fit) in [
+            ("unchanged", vec![external.clone(), builtin.clone()], true),
+            ("removed", vec![builtin.clone()], false),
+            ("added", vec![external.clone(), builtin.clone(), other], false),
+            (
+                "replaced",
+                vec![display(4, external.bounds), builtin.clone()],
+                false,
+            ),
+            (
+                "moved",
+                vec![external.clone(), display(2, rect(0., 1692., 1728., 1117.))],
+                false,
+            ),
+            (
+                "shrunk",
+                vec![display(1, rect(0., 0., 2560., 1440.)), builtin],
+                false,
+            ),
+        ] {
+            assert_eq!(screens_fit_displays(&screens, &displays), fit, "{case}");
+        }
+        // An unreadable display list is no evidence of a change.
+        assert!(displays_match(&screens));
     }
 
     #[test]
