@@ -337,8 +337,11 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         Some(window_tx_store.clone()),
     );
 
-    let notification_center =
-        NotificationCenter::new(wm_controller_sender.clone(), spaces_tx.clone());
+    let notification_center = NotificationCenter::new(
+        wm_controller_sender.clone(),
+        spaces_tx.clone(),
+        spaces_actor.display_reconfig_sender(),
+    );
 
     let process_actor = ProcessActor::new(wm_controller_sender.clone(), spaces_tx);
 

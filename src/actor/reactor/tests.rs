@@ -10815,4 +10815,38 @@ fn display_refresh_reapplies_frames_when_macos_resized_windows_without_notificat
     }
 }
 
+#[test]
+fn window_changes_after_macos_starts_a_display_change_keep_scrolling_widths() {
+    let (mut apps, mut reactor) = test_context();
+    let builtin = CGRect::new(CGPoint::new(0., 34.), CGSize::new(1728., 1083.));
+    apps.make_app_and_settle_on_screen(&mut reactor, builtin, SpaceId::new(1), 1, make_windows(2));
+    reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+        workspace: None,
+        mode: LayoutMode::Scrolling,
+    });
+    apps.simulate_until_quiet(&mut reactor);
+    let before = reactor.layout_manager.layout_engine.serialize_to_string();
+
+    // On replug, macOS starts the change, then puts the window back at its frame
+    // on the external display before Rift handles the display signal.
+    reactor
+        .topology_guard
+        .note_display_signal(crate::sys::skylight::DisplayReconfigFlags::BEGIN_CONFIGURATION);
+    let wid = WindowId::new(1, 1);
+    let restored = CGRect::new(CGPoint::new(0., 31.), CGSize::new(1496., 1661.));
+    apps.windows.get_mut(&wid).unwrap().frame = restored;
+    reactor.handle_loop_event(Event::WindowFrameChanged(
+        wid,
+        restored,
+        None,
+        Requested(false),
+        Some(MouseState::Up),
+    ));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.serialize_to_string(),
+        before
+    );
+}
+
 mod claims;

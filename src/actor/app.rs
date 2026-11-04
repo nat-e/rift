@@ -318,7 +318,7 @@ impl FrameAuthority {
     pub(crate) fn is_current(&self) -> bool {
         self.0
             .as_ref()
-            .is_none_or(|(guard, revision)| guard.invalidated_revision() <= *revision)
+            .is_none_or(|(guard, revision)| guard.allows_window_changes(*revision))
     }
 }
 

@@ -1232,7 +1232,7 @@ impl Reactor {
 
     fn refreshes_blocked(&self) -> bool {
         !self.space_state.authoritative
-            || self.topology_guard.invalidated_revision() > self.space_state.revision
+            || !self.topology_guard.allows_window_changes(self.space_state.revision)
     }
 
     /// A sample older than the accepted model, a topology invalidation, or a held newer
