@@ -11,7 +11,7 @@ use crate::model::WindowVisibility;
 use crate::sys::app::WindowInfo as Window;
 use crate::sys::event::MouseState;
 use crate::sys::geometry::SameAs;
-use crate::sys::screen::{ScreenInfo, SpaceId};
+use crate::sys::screen::SpaceId;
 use crate::sys::window_server::WindowServerInfo;
 
 #[derive(Debug)]
@@ -198,7 +198,6 @@ pub fn classify_window_frame_change(
     requested: bool,
     mouse_state: &mut Option<MouseState>,
     mission_control_active: bool,
-    screens: &[ScreenInfo],
 ) -> FrameChangeDisposition {
     let Some(window) = state.windows.window(wid) else {
         query_mouse_for_active_drag(drag, mouse_state);
@@ -252,24 +251,6 @@ pub fn classify_window_frame_change(
     }
     if mouse_state.is_none() {
         *mouse_state = crate::sys::event::get_mouse_state();
-    }
-    // macOS moves windows for a display change before Rift's display callback
-    // runs, and the topology quarantine only starts with that callback. Measured
-    // against the old displays, such a frame would pass for a resize or move the
-    // user made, so only record where the window is.
-    if *mouse_state != Some(MouseState::Down)
-        && !drag.actor.is_active()
-        && !crate::sys::screen::displays_match(screens)
-    {
-        debug!(
-            ?wid,
-            ?new_frame,
-            "Recording frame only: displays changed since the last snapshot"
-        );
-        if let Some(window) = state.windows.window_mut(wid) {
-            window.frame_monotonic = new_frame;
-        }
-        return FrameChangeDisposition::Handled;
     }
     FrameChangeDisposition::NeedsGeometryAnalysis
 }

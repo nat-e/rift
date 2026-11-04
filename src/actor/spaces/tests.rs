@@ -167,11 +167,11 @@ fn active_display_change_updates_command_context_once_without_a_layout_refresh()
 }
 
 #[test]
-fn every_physical_reconfiguration_revokes_authority_but_begin_only_does_not() {
+fn every_display_reconfiguration_revokes_authority() {
     use DisplayReconfigFlags as F;
     for (flags, revokes) in [
         (F::empty(), false),
-        (F::BEGIN_CONFIGURATION, false),
+        (F::BEGIN_CONFIGURATION, true),
         (F::ADD, true),
         (F::REMOVE, true),
         (F::MOVED, true),
@@ -189,7 +189,7 @@ fn every_physical_reconfiguration_revokes_authority_but_begin_only_does_not() {
     ] {
         let mut rig = Rig::new();
         let before = rig.tick(0, Some(sample(vec![screen(1, "laptop", 1)]))).unwrap();
-        rig.event(Event::DisplayReconfigured { display_id: 1, flags });
+        rig.event(Event::DisplayReconfigured { display_id: 1, flags, sent: 0 });
         assert_eq!(
             rig.actor.topology_guard().invalidated_revision() > before.revision,
             revokes,
@@ -354,6 +354,61 @@ fn inconclusive_samples_never_erase_accepted_topology_or_history_and_can_recover
 }
 
 #[test]
+fn display_signals_hold_the_guard_until_a_snapshot_follows_them() {
+    use DisplayReconfigFlags as F;
+    let laptop = sample(vec![screen(1, "laptop", 1)]);
+    let both = sample(vec![screen(1, "laptop", 1), screen(2, "external", 2)]);
+    let mut rig = Rig::new();
+    let before = rig.tick(0, Some(laptop.clone())).unwrap();
+    let guard = rig.actor.topology_guard();
+    let (mut producer, _requests) = crate::actor::app::AppThreadHandle::channel();
+    producer.set_topology_authority(&guard, before.revision);
+    // On replug, macOS's callback reports a begin for each display before the
+    // actor handles any of the queued signals.
+    let first = guard.note_display_signal(F::BEGIN_CONFIGURATION);
+    let second = guard.note_display_signal(F::BEGIN_CONFIGURATION);
+    assert!(
+        !producer.can_write_frames(),
+        "window moves queued before the change wait too"
+    );
+
+    rig.event(Event::DisplayReconfigured {
+        display_id: 1,
+        flags: F::BEGIN_CONFIGURATION,
+        sent: first,
+    });
+    assert!(rig.tick(0, Some(laptop.clone())).is_none());
+    assert!(rig.tick(1, Some(laptop.clone())).is_some());
+    assert!(
+        guard.displays_changing(),
+        "the second display's signal is still queued"
+    );
+    rig.event(Event::DisplayReconfigured {
+        display_id: 2,
+        flags: F::BEGIN_CONFIGURATION,
+        sent: second,
+    });
+    assert!(rig.tick(0, Some(laptop.clone())).is_none());
+    assert!(rig.tick(1, Some(laptop)).is_some());
+    assert!(!guard.displays_changing());
+
+    // A later signal holds the guard again from its own callback.
+    let added = guard.note_display_signal(F::ADD);
+    assert!(guard.displays_changing());
+    rig.event(Event::DisplayReconfigured {
+        display_id: 2,
+        flags: F::ADD,
+        sent: added,
+    });
+    assert!(rig.tick(0, Some(both.clone())).is_none());
+    let after = rig.tick(1, Some(both)).unwrap();
+    assert!(!guard.displays_changing());
+    assert!(!producer.can_write_frames());
+    producer.set_topology_authority(&guard, after.revision);
+    assert!(producer.can_write_frames());
+}
+
+#[test]
 fn recovery_requires_consecutive_full_samples_and_a_quiet_window_server() {
     let mut base = sample(vec![screen(1, "left", 1), screen(2, "right", 2)]);
     base.inventory.get_mut("left").unwrap().push(SpaceId::new(4));
@@ -372,6 +427,7 @@ fn recovery_requires_consecutive_full_samples_and_a_quiet_window_server() {
         rig.event(Event::DisplayReconfigured {
             display_id: 1,
             flags: DisplayReconfigFlags::MOVED,
+            sent: 0,
         });
         assert!(rig.tick(0, Some(base.clone())).is_none());
         let mut next = base.clone();
@@ -455,6 +511,7 @@ fn topology_changes_report_only_the_spaces_that_need_resizing() {
                 rig.event(Event::DisplayReconfigured {
                     display_id: 2,
                     flags: DisplayReconfigFlags::SET_MAIN,
+                    sent: 0,
                 });
             }
             _ => unreachable!(),
@@ -539,6 +596,7 @@ fn desktop_replacement_switch_and_migration_follow_full_inventory_identity() {
             rig.event(Event::DisplayReconfigured {
                 display_id: 1,
                 flags: DisplayReconfigFlags::ADD,
+                sent: 0,
             });
         }
         // Coalesce with a queued native query; the notification carries no remap hint.
@@ -658,7 +716,7 @@ fn fullscreen_changes_preserve_other_displays_user_context_in_any_enumeration_or
 #[test]
 fn borrowing_a_fullscreen_displays_desktop_needs_physical_evidence_or_persistence() {
     let fullscreen = SpaceId::new(0x400000002);
-    for case in ["transient", "persistent", "set main"] {
+    for case in ["transient", "persistent", "begin only", "set main"] {
         let mut rig = Rig::new();
         let base = sample(vec![screen(1, "left", 1), screen(2, "right", 2)]);
         rig.tick(0, Some(base.clone())).unwrap();
@@ -675,10 +733,19 @@ fn borrowing_a_fullscreen_displays_desktop_needs_physical_evidence_or_persistenc
         let (samples, hits) = match case {
             "transient" => (3, u8::MAX),
             "persistent" => (REFRESH_MAX_RETRIES, REFRESH_MAX_RETRIES),
+            "begin only" => {
+                rig.event(Event::DisplayReconfigured {
+                    display_id: 1,
+                    flags: DisplayReconfigFlags::BEGIN_CONFIGURATION,
+                    sent: 0,
+                });
+                (REFRESH_MAX_RETRIES, REFRESH_MAX_RETRIES)
+            }
             _ => {
                 rig.event(Event::DisplayReconfigured {
                     display_id: 1,
                     flags: DisplayReconfigFlags::SET_MAIN,
+                    sent: 0,
                 });
                 (DISPLAY_STABLE_REQUIRED_HITS, DISPLAY_STABLE_REQUIRED_HITS)
             }

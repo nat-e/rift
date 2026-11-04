@@ -5,8 +5,6 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::{future, mem};
 
-use dispatchr::queue;
-use dispatchr::time::Time;
 use objc2::rc::{Allocated, Retained};
 use objc2::{
     AnyThread, ClassType, DeclaredClass, Encode, Encoding, MainThreadMarker, define_class,
@@ -22,7 +20,6 @@ use tracing::{debug, info_span, trace, warn};
 use super::spaces;
 use super::wm_controller::{self, WmEvent};
 use crate::sys::app::NSRunningApplicationExt;
-use crate::sys::dispatch::DispatchExt;
 use crate::sys::power::{init_power_state, set_low_power_mode_state};
 use crate::sys::skylight::{CGDisplayRegisterReconfigurationCallback, DisplayReconfigFlags};
 
@@ -30,6 +27,7 @@ use crate::sys::skylight::{CGDisplayRegisterReconfigurationCallback, DisplayReco
 struct Instance {
     events_tx: wm_controller::Sender,
     spaces_tx: spaces::Sender,
+    display_reconfig_tx: spaces::DisplayReconfigSender,
     session_inactive_hint: Cell<bool>,
 }
 
@@ -112,10 +110,15 @@ define_class! {
 }
 
 impl NotificationCenterInner {
-    fn new(events_tx: wm_controller::Sender, spaces_tx: spaces::Sender) -> Retained<Self> {
+    fn new(
+        events_tx: wm_controller::Sender,
+        spaces_tx: spaces::Sender,
+        display_reconfig_tx: spaces::DisplayReconfigSender,
+    ) -> Retained<Self> {
         let instance = Instance {
             events_tx,
             spaces_tx,
+            display_reconfig_tx,
             session_inactive_hint: Cell::new(false),
         };
         let handler: Retained<Self> = unsafe { msg_send![Self::alloc(), initWith: instance] };
@@ -285,16 +288,12 @@ impl NotificationCenterInner {
         if user_info.is_null() {
             return;
         }
-        // The registered handler is alive during this callback. Only clone its
-        // immutable thread-safe sender; no native object or Cell crosses queues.
-        let tx = unsafe { &*user_info.cast::<NotificationCenterInner>() }
+        // The registered handler is alive during this callback. Only touch its
+        // thread-safe sender.
+        unsafe { &*user_info.cast::<NotificationCenterInner>() }
             .ivars()
-            .spaces_tx
-            .clone();
-        let parsed = DisplayReconfigFlags::from_bits_truncate(flags);
-        queue::main().after_f_s(Time::NOW, (tx, display_id, parsed), |(tx, display_id, flags)| {
-            tx.send(spaces::Event::DisplayReconfigured { display_id, flags });
-        });
+            .display_reconfig_tx
+            .send(display_id, DisplayReconfigFlags::from_bits_truncate(flags));
     }
 }
 
@@ -316,8 +315,13 @@ pub struct NotificationCenter {
 }
 
 impl NotificationCenter {
-    pub fn new(events_tx: wm_controller::Sender, spaces_tx: spaces::Sender) -> Self {
-        let handler = NotificationCenterInner::new(events_tx.clone(), spaces_tx);
+    pub fn new(
+        events_tx: wm_controller::Sender,
+        spaces_tx: spaces::Sender,
+        display_reconfig_tx: spaces::DisplayReconfigSender,
+    ) -> Self {
+        let handler =
+            NotificationCenterInner::new(events_tx.clone(), spaces_tx, display_reconfig_tx);
 
         // SAFETY: Selector must have signature fn(&self, &NSNotification)
         let register_unsafe =

@@ -10816,67 +10816,36 @@ fn display_refresh_reapplies_frames_when_macos_resized_windows_without_notificat
 }
 
 #[test]
-fn frame_change_before_the_display_callback_keeps_scrolling_widths() {
-    use crate::sys::screen::{ScreenId, set_connected_displays_override};
-
+fn window_changes_after_macos_starts_a_display_change_keep_scrolling_widths() {
     let (mut apps, mut reactor) = test_context();
     let builtin = CGRect::new(CGPoint::new(0., 34.), CGSize::new(1728., 1083.));
-    let space = SpaceId::new(1);
-    apps.make_app_and_settle_on_screen(&mut reactor, builtin, space, 1, make_windows(2));
+    apps.make_app_and_settle_on_screen(&mut reactor, builtin, SpaceId::new(1), 1, make_windows(2));
     reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
         workspace: None,
         mode: LayoutMode::Scrolling,
     });
     apps.simulate_until_quiet(&mut reactor);
+    let before = reactor.layout_manager.layout_engine.serialize_to_string();
+
+    // On replug, macOS starts the change, then puts the window back at its frame
+    // on the external display before Rift handles the display signal.
+    reactor
+        .topology_guard
+        .note_display_signal(crate::sys::skylight::DisplayReconfigFlags::BEGIN_CONFIGURATION);
     let wid = WindowId::new(1, 1);
-    let width = apps.windows[&wid].frame.size.width;
-    // macOS puts the window back at its frame on the returning external
-    // display, which lies on the built-in display as Rift still knows it.
     let restored = CGRect::new(CGPoint::new(0., 31.), CGSize::new(1496., 1661.));
-    let restore = |reactor: &mut Reactor, apps: &mut Apps| {
-        apps.windows.get_mut(&wid).unwrap().frame = restored;
-        reactor.handle_event(Event::WindowFrameChanged(
-            wid,
-            restored,
-            None,
-            Requested(false),
-            Some(MouseState::Up),
-        ));
-        apps.simulate_until_quiet(reactor);
-    };
-    let width_after_display_refresh = |reactor: &mut Reactor, apps: &mut Apps| {
-        let mut snapshot =
-            forwarded_space_state(make_screen_snapshots(vec![builtin], vec![Some(space)]));
-        snapshot.display_set_changed = true;
-        snapshot.should_force_refresh_layout = true;
-        reactor.handle_event(Event::SpaceStateChanged(snapshot));
-        apps.simulate_until_quiet(reactor);
-        apps.windows[&wid].frame.size.width
-    };
+    apps.windows.get_mut(&wid).unwrap().frame = restored;
+    reactor.handle_loop_event(Event::WindowFrameChanged(
+        wid,
+        restored,
+        None,
+        Requested(false),
+        Some(MouseState::Up),
+    ));
 
-    set_connected_displays_override(Some(vec![
-        (
-            ScreenId::new(0),
-            CGRect::new(CGPoint::new(623., 1692.), CGSize::new(1728., 1117.)),
-        ),
-        (
-            ScreenId::new(1),
-            CGRect::new(CGPoint::ZERO, CGSize::new(3008., 1692.)),
-        ),
-    ]));
-    restore(&mut reactor, &mut apps);
-    set_connected_displays_override(None);
-    assert!(
-        reactor.state.windows.window(wid).unwrap().frame_monotonic.same_as(restored),
-        "the frame is recorded even though the layout ignores it"
-    );
-    assert_eq!(width_after_display_refresh(&mut reactor, &mut apps), width);
-
-    // Once the displays match, the same frame change is the window's new width.
-    restore(&mut reactor, &mut apps);
     assert_eq!(
-        width_after_display_refresh(&mut reactor, &mut apps),
-        restored.size.width
+        reactor.layout_manager.layout_engine.serialize_to_string(),
+        before
     );
 }
 

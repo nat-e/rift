@@ -46,16 +46,78 @@ const REFRESH_RECOVERY_DELAY_NS: i64 = 1_000_000_000;
 // Recovery needs two matching physical/Space samples and a quiet WindowServer.
 const DISPLAY_STABLE_REQUIRED_HITS: u8 = 2;
 
-/// Published before invalidation is queued. A reactor must not accept an older
-/// snapshot or mutate windows while this revision is ahead of its own.
+/// Published before invalidation is queued. A reactor must not accept a snapshot
+/// older than the invalidated revision, and windows may only move while the guard
+/// allows changes under the revision they act on.
 /// Each actor pair owns its record; tests and independent instances cannot interfere.
 #[derive(Debug, Clone, Default)]
-pub struct TopologyGuard(Arc<AtomicU64>);
+pub struct TopologyGuard(Arc<GuardState>);
+
+#[derive(Debug, Default)]
+struct GuardState {
+    invalidated_revision: AtomicU64,
+    // How many display signals macOS has sent, and how many of those a forwarded
+    // snapshot already reflects.
+    display_signals_sent: AtomicU64,
+    display_signals_settled: AtomicU64,
+}
 
 impl TopologyGuard {
-    pub fn invalidated_revision(&self) -> u64 { self.0.load(Ordering::Acquire) }
+    pub fn invalidated_revision(&self) -> u64 {
+        self.0.invalidated_revision.load(Ordering::Acquire)
+    }
 
-    fn invalidate(&self, revision: u64) { self.0.store(revision, Ordering::Release); }
+    fn invalidate(&self, revision: u64) {
+        self.0.invalidated_revision.store(revision, Ordering::Release);
+    }
+
+    /// Whether windows may change under the topology accepted at `revision`: it is
+    /// still current, and macOS has not sent a display signal since.
+    pub fn allows_window_changes(&self, revision: u64) -> bool {
+        self.invalidated_revision() <= revision && !self.displays_changing()
+    }
+
+    /// Whether macOS sent a display signal that no forwarded snapshot reflects yet.
+    fn displays_changing(&self) -> bool {
+        self.0.display_signals_sent.load(Ordering::Acquire)
+            > self.0.display_signals_settled.load(Ordering::Acquire)
+    }
+
+    /// Counts a display signal, and returns how many have been sent so far. An empty
+    /// signal changes nothing, so it does not count.
+    pub(crate) fn note_display_signal(&self, flags: DisplayReconfigFlags) -> u64 {
+        if flags.is_empty() {
+            self.0.display_signals_sent.load(Ordering::Acquire)
+        } else {
+            self.0.display_signals_sent.fetch_add(1, Ordering::AcqRel) + 1
+        }
+    }
+
+    fn settle_display_signals(&self, sent: u64) {
+        self.0.display_signals_settled.fetch_max(sent, Ordering::AcqRel);
+    }
+}
+
+/// Where macOS's display callback reports to the spaces actor.
+#[derive(Clone)]
+pub struct DisplayReconfigSender {
+    events: Sender,
+    guard: TopologyGuard,
+}
+
+impl DisplayReconfigSender {
+    /// The guard holds from the moment macOS sends a display signal: macOS moves
+    /// windows before the actor gets to handle the queued signal.
+    pub fn send(&self, display_id: u32, flags: DisplayReconfigFlags) {
+        let sent = self.guard.note_display_signal(flags);
+        queue::main().after_f_s(
+            Time::NOW,
+            (self.events.clone(), display_id, flags, sent),
+            |(events, display_id, flags, sent)| {
+                events.send(Event::DisplayReconfigured { display_id, flags, sent });
+            },
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +132,8 @@ pub enum Event {
     DisplayReconfigured {
         display_id: u32,
         flags: DisplayReconfigFlags,
+        /// How many display signals macOS had sent, this one included.
+        sent: u64,
     },
     SpaceInventoryChanged,
     ReconcileWindowSpaces,
@@ -167,6 +231,8 @@ pub struct AuthorityState {
     last_forwarded: Option<ForwardedSpaceState>,
     timers_enabled: bool,
     topology_guard: TopologyGuard,
+    // How many display signals macOS had sent, as of the last one this actor handled.
+    display_signals_handled: u64,
     churn_started: Option<Instant>,
 }
 
@@ -194,6 +260,7 @@ impl Default for AuthorityState {
             last_forwarded: None,
             timers_enabled: true,
             topology_guard: TopologyGuard::default(),
+            display_signals_handled: 0,
             churn_started: None,
         }
     }
@@ -249,6 +316,13 @@ impl SpacesActor {
     }
 
     pub fn topology_guard(&self) -> TopologyGuard { self.state.topology_guard.clone() }
+
+    pub fn display_reconfig_sender(&self) -> DisplayReconfigSender {
+        DisplayReconfigSender {
+            events: self.sender.clone(),
+            guard: self.topology_guard(),
+        }
+    }
 
     pub async fn run(mut self) {
         while let Some((span, event)) = self.receiver.recv().await {
@@ -318,8 +392,8 @@ impl SpacesActor {
                 }
                 self.schedule_screen_refresh();
             }
-            Event::DisplayReconfigured { display_id, flags } => {
-                self.handle_display_reconfig_event(display_id, flags);
+            Event::DisplayReconfigured { display_id, flags, sent } => {
+                self.handle_display_reconfig_event(display_id, flags, sent);
             }
             Event::ReconcileWindowSpaces => {
                 // A native move may be the first evidence of display churn. Refresh
@@ -1085,12 +1159,15 @@ impl SpacesActor {
         {
             self.begin_display_churn(DisplayReconfigFlags::empty());
         }
+        // A begin only says a change is coming; the signals after it say what changed.
+        let display_change_reported = !self
+            .state
+            .display_churn_flags
+            .difference(DisplayReconfigFlags::BEGIN_CONFIGURATION)
+            .is_empty();
         // Without physical evidence, borrowing is accepted only if it outlasts the
         // whole retry burst: a real move is not frozen, a transition never commits.
-        let required_hits = if borrowed
-            && !physical_topology_changed
-            && self.state.display_churn_flags.is_empty()
-        {
+        let required_hits = if borrowed && !physical_topology_changed && !display_change_reported {
             REFRESH_MAX_RETRIES
         } else {
             DISPLAY_STABLE_REQUIRED_HITS
@@ -1111,6 +1188,11 @@ impl SpacesActor {
             Some(forwarded.screens.iter().map(|screen| screen.space).collect());
         self.state.awaiting_space_switch_confirmation = false;
         let membership_complete = forwarded.membership_complete;
+        // Every counted signal starts churn, and churn ends only with a stable
+        // snapshot, so this one reflects every signal handled so far.
+        self.state
+            .topology_guard
+            .settle_display_signals(self.state.display_signals_handled);
         self.wm_tx.send(wm_controller::WmEvent::SpaceStateUpdated(forwarded, converter));
         if self.state.display_churn_active {
             tracing::info!(revision = self.state.revision,
@@ -1168,7 +1250,13 @@ impl SpacesActor {
         );
     }
 
-    fn handle_display_reconfig_event(&mut self, _display_id: u32, flags: DisplayReconfigFlags) {
+    fn handle_display_reconfig_event(
+        &mut self,
+        _display_id: u32,
+        flags: DisplayReconfigFlags,
+        sent: u64,
+    ) {
+        self.state.display_signals_handled = self.state.display_signals_handled.max(sent);
         if !Self::should_begin_display_churn(flags) {
             return;
         }
@@ -1180,24 +1268,10 @@ impl SpacesActor {
     }
 
     fn should_begin_display_churn(flags: DisplayReconfigFlags) -> bool {
-        // Native macOS space switches can still emit CGDisplay reconfig callbacks on a
-        // single physical display. Churn quarantine is only for unstable physical display
-        // topology, not ordinary current-space changes which are handled separately.
-        // External display setting changes like main-display promotion and desktop shape
-        // updates can temporarily destabilize active-space mappings, so they must be
-        // buffered like other topology-affecting display reconfigurations.
-        flags.intersects(
-            DisplayReconfigFlags::ADD
-                | DisplayReconfigFlags::REMOVE
-                | DisplayReconfigFlags::MOVED
-                | DisplayReconfigFlags::SET_MAIN
-                | DisplayReconfigFlags::SET_MODE
-                | DisplayReconfigFlags::ENABLED
-                | DisplayReconfigFlags::DISABLED
-                | DisplayReconfigFlags::MIRROR
-                | DisplayReconfigFlags::UNMIRROR
-                | DisplayReconfigFlags::DESKTOP_SHAPE_CHANGED,
-        )
+        // Any display callback means displays are changing: on macOS 26, desktop
+        // switches and full screen send none. Every such callback already holds the
+        // topology guard, and only the snapshot that ends churn releases it.
+        !flags.is_empty()
     }
 
     fn begin_display_churn(&mut self, flags: DisplayReconfigFlags) {
