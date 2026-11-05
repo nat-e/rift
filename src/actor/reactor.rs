@@ -1839,6 +1839,23 @@ impl Reactor {
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
                 let mission_control_active = self.is_mission_control_active();
                 let mut effective_mouse_state = mouse_state;
+                // A delayed move from an app can invalidate a parked frame even when
+                // WindowServer reports Rift's transaction id. Drop the stale hide
+                // target so the next layout can re-park the window.
+                if !mission_control_active
+                    && !requested.0
+                    && mouse_state != Some(MouseState::Down)
+                    && let Some(window) = self.state.windows.window(wid)
+                    && let Some(wsid) = window.info.sys_id
+                    && self.hidden_assigned_space_for_window_id(wid).is_some()
+                    && last_seen == Some(self.transaction_manager.get_last_sent_txid(wsid))
+                    && self
+                        .transaction_manager
+                        .get_target_frame(wsid)
+                        .is_some_and(|target| !new_frame.same_as(target))
+                {
+                    self.transaction_manager.clear_target_for_window(wsid);
+                }
                 if matches!(
                     window_workflow::classify_window_frame_change(
                         &mut self.state,
@@ -2442,16 +2459,30 @@ impl Reactor {
                     ));
                 };
                 let request = layout::RestoreRequest { scope, active_space, source };
-                let outcome = EventOutcome::window_membership_changed(false, true);
+                let mut outcome = EventOutcome::window_membership_changed(false, true);
+                let visible: Vec<_> = self.iter_active_spaces().collect();
                 let report = self.layout_manager.layout_engine.restore_layout(
                     path,
                     request,
+                    &visible,
                     &mut self.state.windows,
-                    &self.config.virtual_workspaces,
                     &self.config.settings.layout,
                 );
                 return Ok(match report {
-                    Ok(report) => outcome.with_stdout_line(report.summary()),
+                    Ok(report) => {
+                        for &(window, from, to) in &report.moved {
+                            // A restored floating frame is already on the display it returns to.
+                            let floating =
+                                self.layout_manager.layout_engine.is_window_floating(window);
+                            let source = if floating { to } else { from };
+                            if floating {
+                                self.state.windows.clear_floating_display_geometry(window);
+                            }
+                            let source = self.space_state.screen_by_space(source).map(|s| s.frame);
+                            outcome.absorb(self.request_window_transfer(window, to, source));
+                        }
+                        outcome.with_stdout_line(report.summary())
+                    }
                     Err(error) => {
                         tracing::error!(?scope, %error, "Could not restore saved layout");
                         outcome.with_stdout_line(format!("Could not restore saved layout: {error}"))
@@ -3670,12 +3701,17 @@ impl Reactor {
 
         let current_display_spaces = screens
             .iter()
-            .filter_map(|screen| screen.space.map(|space| (space, screen.display_uuid.clone())))
+            .filter_map(|screen| {
+                screen
+                    .space
+                    .map(|space| (space, screen.display_uuid.clone(), screen.frame.size))
+            })
             .collect::<Vec<_>>();
-        self.layout_manager.layout_engine.reconcile_startup_spaces(
+        self.layout_manager.layout_engine.resolve_saved_spaces(
             &mut self.state.windows,
             &current_display_spaces,
             screens.len(),
+            &display_space_ids,
         );
 
         let empty = HashMap::default();
@@ -3776,6 +3812,10 @@ impl Reactor {
         self.space_activation_policy
             .on_spaces_updated(activation_config, &self.space_state.screens);
         let previously_active = self.set_active_spaces_from_snapshot(&authoritative_spaces);
+        self.layout_manager
+            .layout_engine
+            .workspaces_mut()
+            .update_display_count(self.space_state.screens.len());
         let engine = &self.layout_manager.layout_engine;
         let mut refits = Vec::new();
         for screen in &self.space_state.screens {
@@ -4904,7 +4944,7 @@ impl Reactor {
         self.layout_manager
             .layout_engine
             .workspaces_mut()
-            .ensure_visible_spaces(&spaces, rule_space);
+            .ensure_visible_spaces(&spaces, screens.len(), rule_space);
         for space in spaces {
             self.expose_space_if_known(space);
         }
